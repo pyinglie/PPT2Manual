@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-修正页码位置的PDF合并器
+修正目录显示的PDF合并器
 """
 
 import os
@@ -99,7 +99,7 @@ class ChineseFontManager:
 
 
 class PDFMerger:
-    """PDF合并器 - 修正页码版本"""
+    """PDF合并器 - 统一8页布局版本"""
 
     def __init__(self):
         self.temp_files = []
@@ -119,8 +119,36 @@ class PDFMerger:
                 logging.warning(f"清理临时文件失败 {temp_file}: {e}")
         self.temp_files.clear()
 
+    def get_pdf_info(self, pdf_path: str) -> Dict[str, Any]:
+        """获取PDF文件信息"""
+        try:
+            doc = fitz.open(pdf_path)
+            page_count = doc.page_count
+
+            # 尝试获取文档标题
+            metadata = doc.metadata
+            title = metadata.get('title', '')
+            if not title:
+                title = Path(pdf_path).stem
+
+            doc.close()
+
+            return {
+                'page_count': page_count,
+                'title': title,
+                'file_type': 'pdf'
+            }
+
+        except Exception as e:
+            logging.error(f"获取PDF信息失败 {pdf_path}: {e}")
+            return {
+                'page_count': 0,
+                'title': Path(pdf_path).stem,
+                'file_type': 'pdf'
+            }
+
     def merge_pdfs_with_bookmarks(self, pdf_info_list: List[Dict[str, Any]], output_path: str) -> bool:
-        """合并PDF文件并添加书签（统一页码）"""
+        """合并PDF文件并添加书签（统一8页布局）"""
         try:
             logging.info(f"开始合并PDF文件，共 {len(pdf_info_list)} 个文件")
 
@@ -134,6 +162,7 @@ class PDFMerger:
             for i, pdf_info in enumerate(pdf_info_list):
                 pdf_file = pdf_info['file']
                 title = pdf_info.get('title', f'文档{i + 1}')
+                file_type = pdf_info.get('file_type', 'converted_ppt')
 
                 if os.path.exists(pdf_file):
                     try:
@@ -146,11 +175,21 @@ class PDFMerger:
                             'file': pdf_file,
                             'page_count': page_count,
                             'start_page_in_final': total_content_pages + 2,  # +1为目录页，+1因为从1开始计数
-                            'order': i
+                            'order': i,
+                            'file_type': file_type
                         })
 
                         total_content_pages += page_count
-                        logging.info(f"PDF {i + 1}: {title} - {page_count} 页")
+
+                        # 显示文件类型
+                        if file_type == 'converted_ppt':
+                            type_str = "PPT转换(8页布局)"
+                        elif file_type == 'converted_pdf':
+                            type_str = "PDF转换(8页布局)"
+                        else:
+                            type_str = "直接导入"
+
+                        logging.info(f"文档 {i + 1}: {title} - {page_count} 页 ({type_str})")
 
                     except Exception as e:
                         logging.error(f"无法读取PDF文件 {pdf_file}: {e}")
@@ -184,9 +223,10 @@ class PDFMerger:
             for pdf_info in pdf_page_info:
                 pdf_file = pdf_info['file']
                 title = pdf_info['title']
+                file_type = pdf_info['file_type']
 
                 try:
-                    logging.info(f"合并PDF: {title}")
+                    logging.info(f"合并PDF: {title} ({file_type})")
 
                     src_doc = fitz.open(pdf_file)
 
@@ -196,9 +236,6 @@ class PDFMerger:
                         'page': current_page,
                         'level': 1
                     })
-
-                    # 清除源PDF中的页码（如果有的话）
-                    self._remove_existing_page_numbers(src_doc)
 
                     # 插入页面
                     output_doc.insert_pdf(src_doc)
@@ -241,29 +278,8 @@ class PDFMerger:
             logging.error(f"错误详情: {traceback.format_exc()}")
             return False
 
-    def _remove_existing_page_numbers(self, doc: fitz.Document):
-        """移除现有的页码（尝试清除可能存在的页码）"""
-        try:
-            for page_num in range(doc.page_count):
-                page = doc[page_num]
-
-                # 获取页面底部区域的文本（可能的页码位置）
-                bottom_rect = fitz.Rect(0, page.rect.height - 50, page.rect.width, page.rect.height)
-                text_instances = page.search_for("第", clip=bottom_rect)
-
-                # 如果找到"第"字，尝试移除相关文本
-                for inst in text_instances:
-                    try:
-                        # 这里可以添加更复杂的页码检测和移除逻辑
-                        pass
-                    except:
-                        pass
-
-        except Exception as e:
-            logging.debug(f"移除现有页码时出错: {e}")
-
     def _create_table_of_contents_pdf_with_accurate_pages(self, pdf_page_info: List[Dict[str, Any]]) -> Optional[str]:
-        """创建带有准确页码的目录页"""
+        """创建带有准确页码和文件类型标识的目录页"""
         try:
             temp_toc_pdf = get_unique_temp_filename("toc_", ".pdf")
             self.temp_files.append(temp_toc_pdf)
@@ -284,11 +300,6 @@ class PDFMerger:
             title_x = (page_width - title_width) / 2
             c.drawString(title_x, current_y + 40, title_text)
 
-            # 绘制分割线
-            #c.setStrokeColor(lightgrey)
-            #c.setLineWidth(1)
-            #c.line(margin, current_y + 10, page_width - margin, current_y + 10)
-
             # 目录项
             c.setFont(font_name, 12)
             c.setFillColor(black)
@@ -296,9 +307,6 @@ class PDFMerger:
             for i, info in enumerate(pdf_page_info):
                 title = info['title']
                 start_page = info['start_page_in_final']
-
-                if len(title) > 40:
-                    title = title[:37] + "..."
 
                 toc_text = f"{i + 1}. {title}"
                 page_text = f"第 {start_page} 页"
@@ -388,7 +396,7 @@ class PDFMerger:
                 rect = page.rect
                 text_width_estimate = len(page_text) * 5  # 估算文本宽度
                 text_x = (rect.width - text_width_estimate) / 2
-                text_y = rect.height - 40  # 距离底部25个点
+                text_y = 25  # 距离底部25个点
 
                 # 添加页码到页面底部
                 page.insert_text(
@@ -410,12 +418,12 @@ class PDFMerger:
         """设置文档元数据"""
         try:
             metadata = {
-                'title': '合并PDF手册',
+                'title': '统一布局合并手册',
                 'author': 'PPT2Manual',
-                'subject': f'由 {pdf_count} 个PPT文件合并生成的PDF手册',
+                'subject': f'由 {pdf_count} 个文件合并生成的统一8页布局PDF手册',
                 'creator': 'PPT2Manual v0.0.1-alpha',
                 'producer': 'PyMuPDF',
-                'keywords': 'PPT, PDF, 手册, 合并'
+                'keywords': 'PPT, PDF, 手册, 合并, 8页布局'
             }
 
             doc.set_metadata(metadata)

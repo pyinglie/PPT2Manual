@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPT转换核心逻辑 - 修正 COM 接口版本
+PPT转换核心逻辑 - 修正类名引用
 """
-import io
+
 import os
 import sys
 import time
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import tempfile
 import traceback
 import subprocess
 
 from PySide6.QtCore import QThread, Signal
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # 导入必要的库
 try:
@@ -31,10 +29,12 @@ except ImportError as e:
 
 from .utils import ProgressTracker, get_unique_temp_filename, clean_filename
 from .pdf_merger import PDFMerger
+from .slide_layout_generator import ChineseSlideLayoutGenerator  # 修正导入
+from .pdf_layout_generator import PDFLayoutGenerator
 
 
 class PPTConverter:
-    """PPT转换器 - 修正版"""
+    """PPT转换器"""
 
     def __init__(self):
         self.temp_files = []
@@ -111,7 +111,7 @@ class PPTConverter:
                 image_path = os.path.join(output_dir, image_filename)
 
                 # 导出幻灯片为PNG
-                slide.Export(image_path, "PNG", 1440, 960)  # 使用高分辨率
+                slide.Export(image_path, "PNG", 1920, 1080)
 
                 if os.path.exists(image_path):
                     image_files.append(image_path)
@@ -297,12 +297,13 @@ try {{
             return []
 
 
-class PPTConverterMain:
-    """主PPT转换器"""
+class MixedFileConverterMain:
+    """混合文件转换器主类"""
 
     def __init__(self):
         self.ppt_converter = PPTConverter()
-        self.layout_generator = SlideLayoutGenerator()
+        self.slide_layout_generator = ChineseSlideLayoutGenerator()  # 修正类名
+        self.pdf_layout_generator = PDFLayoutGenerator()
 
     def __del__(self):
         self.cleanup_temp_files()
@@ -326,7 +327,7 @@ class PPTConverterMain:
 
             # 创建布局PDF
             title = Path(ppt_path).stem
-            success = self.layout_generator.create_layout_pdf(
+            success = self.slide_layout_generator.create_layout_pdf(
                 slide_images, output_path, title
             )
 
@@ -339,21 +340,40 @@ class PPTConverterMain:
             logging.error(f"PPT转换失败: {e}")
             return False
 
+    def convert_pdf_to_layout_pdf(self, pdf_path: str, output_path: str) -> bool:
+        """将PDF转换为8页布局PDF"""
+        try:
+            logging.info(f"开始转换PDF到布局PDF: {pdf_path}")
 
-class PPTConverterThread(QThread):
-    """PPT转换线程"""
+            title = Path(pdf_path).stem
+            success = self.pdf_layout_generator.convert_pdf_to_layout(
+                pdf_path, output_path, title
+            )
+
+            if success:
+                logging.info(f"PDF布局转换完成: {output_path}")
+
+            return success
+
+        except Exception as e:
+            logging.error(f"PDF布局转换失败: {e}")
+            return False
+
+
+class MixedFileConverterThread(QThread):
+    """混合文件转换线程 - PDF也采用8页布局"""
 
     progress_updated = Signal(int, int)
     status_updated = Signal(str)
     conversion_finished = Signal(str)
     error_occurred = Signal(str)
 
-    def __init__(self, ppt_files: List[str], output_path: str):
+    def __init__(self, file_list: List[Dict[str, Any]], output_path: str):
         super().__init__()
-        self.ppt_files = ppt_files
+        self.file_list = file_list
         self.output_path = output_path
         self.is_cancelled = False
-        self.converter = PPTConverterMain()
+        self.converter = MixedFileConverterMain()
         self.merger = PDFMerger()
 
     def cancel(self):
@@ -361,30 +381,38 @@ class PPTConverterThread(QThread):
         self.is_cancelled = True
 
     def run(self):
-        """运行转换"""
+        """运行混合文件转换"""
         try:
             self.status_updated.emit("初始化转换器...")
 
-            if not self.ppt_files:
-                self.error_occurred.emit("没有PPT文件需要转换")
+            if not self.file_list:
+                self.error_occurred.emit("没有文件需要转换")
                 return
 
+            # 分离PPT和PDF文件
+            ppt_files = [item for item in self.file_list if item['type'] == 'ppt']
+            pdf_files = [item for item in self.file_list if item['type'] == 'pdf']
+
+            logging.info(f"混合文件处理: {len(ppt_files)} 个PPT文件, {len(pdf_files)} 个PDF文件")
+
             # 创建进度跟踪器
-            total_steps = len(self.ppt_files) + 2
+            total_steps = len(ppt_files) + len(pdf_files) + 2  # 所有文件转换 + 合并 + 优化
             progress_tracker = ProgressTracker(total_steps)
 
             # 临时PDF文件列表
             temp_pdfs = []
+            merge_info = []
 
             try:
-                # 步骤1: 转换每个PPT文件
-                for i, ppt_file in enumerate(self.ppt_files):
+                # 步骤1: 转换PPT文件为布局PDF
+                for i, ppt_info in enumerate(ppt_files):
                     if self.is_cancelled:
                         self.status_updated.emit("转换已取消")
                         return
 
+                    ppt_file = ppt_info['file']
                     file_name = Path(ppt_file).name
-                    self.status_updated.emit(f"转换PPT文件 ({i + 1}/{len(self.ppt_files)}): {file_name}")
+                    self.status_updated.emit(f"转换PPT文件 ({i + 1}/{len(ppt_files)}): {file_name}")
 
                     # 创建临时PDF文件
                     temp_pdf = get_unique_temp_filename("ppt_layout_", ".pdf")
@@ -396,34 +424,68 @@ class PPTConverterThread(QThread):
                         self.error_occurred.emit(f"转换PPT失败: {file_name}")
                         return
 
+                    # 添加到合并信息
+                    merge_info.append({
+                        'file': temp_pdf,
+                        'title': ppt_info.get('title', Path(ppt_file).stem),
+                        'order': ppt_info.get('order', 0),
+                        'file_type': 'converted_ppt'
+                    })
+
                     # 更新进度
                     progress_tracker.next_step()
                     progress = progress_tracker.get_progress_percentage()
                     self.progress_updated.emit(progress, 100)
 
-                    self.status_updated.emit(f"完成: {file_name}")
+                    self.status_updated.emit(f"完成PPT转换: {file_name}")
+                    self.msleep(100)
+
+                # 步骤2: 转换PDF文件为布局PDF
+                for i, pdf_info in enumerate(pdf_files):
+                    if self.is_cancelled:
+                        self.status_updated.emit("转换已取消")
+                        return
+
+                    pdf_file = pdf_info['file']
+                    file_name = Path(pdf_file).name
+                    self.status_updated.emit(f"转换PDF布局 ({i + 1}/{len(pdf_files)}): {file_name}")
+
+                    # 创建临时布局PDF文件
+                    temp_pdf = get_unique_temp_filename("pdf_layout_", ".pdf")
+                    temp_pdfs.append(temp_pdf)
+
+                    # 转换PDF为布局PDF
+                    success = self.converter.convert_pdf_to_layout_pdf(pdf_file, temp_pdf)
+                    if not success:
+                        self.error_occurred.emit(f"转换PDF布局失败: {file_name}")
+                        return
+
+                    # 添加到合并信息
+                    merge_info.append({
+                        'file': temp_pdf,
+                        'title': pdf_info.get('title', Path(pdf_file).stem),
+                        'order': pdf_info.get('order', 0),
+                        'file_type': 'converted_pdf'
+                    })
+
+                    # 更新进度
+                    progress_tracker.next_step()
+                    progress = progress_tracker.get_progress_percentage()
+                    self.progress_updated.emit(progress, 100)
+
+                    self.status_updated.emit(f"完成PDF布局转换: {file_name}")
                     self.msleep(100)
 
                 if self.is_cancelled:
                     return
 
-                # 步骤2: 合并PDF文件
+                # 根据order字段排序
+                merge_info.sort(key=lambda x: x.get('order', 0))
+
+                # 步骤3: 合并所有布局PDF文件
                 self.status_updated.emit("合并PDF文件...")
 
-                # 准备合并信息
-                merge_info = []
-                for i, (ppt_file, pdf_file) in enumerate(zip(self.ppt_files, temp_pdfs)):
-                    title = Path(ppt_file).stem
-                    merge_info.append({
-                        'file': pdf_file,
-                        'title': title,
-                        'order': i
-                    })
-
-                # 执行合并
-                success = self.merger.merge_pdfs_with_bookmarks(
-                    merge_info, self.output_path
-                )
+                success = self.merger.merge_pdfs_with_bookmarks(merge_info, self.output_path)
 
                 if not success:
                     self.error_occurred.emit("PDF合并失败")
@@ -436,17 +498,17 @@ class PPTConverterThread(QThread):
                 if self.is_cancelled:
                     return
 
-                # 步骤3: 后处理
+                # 步骤4: 优化PDF
                 self.status_updated.emit("优化PDF文件...")
 
-                # PDF优化
                 self.merger.optimize_pdf(self.output_path)
 
                 progress_tracker.next_step()
                 self.progress_updated.emit(100, 100)
 
                 # 完成
-                self.status_updated.emit(f"转换完成！已生成 {len(self.ppt_files)} 个PPT的合并PDF")
+                total_files = len(ppt_files) + len(pdf_files)
+                self.status_updated.emit(f"转换完成！已处理 {total_files} 个文件 (统一8页布局)")
                 self.conversion_finished.emit(self.output_path)
 
             finally:
@@ -468,219 +530,19 @@ class PPTConverterThread(QThread):
             self.error_occurred.emit(error_msg)
 
 
-class SlideLayoutGenerator:
-    """修正版幻灯片布局生成器 - 正确比例和页码"""
+# 保持向后兼容性
+class PPTConverterThread(MixedFileConverterThread):
+    """PPT转换线程 - 向后兼容版本"""
 
-    def __init__(self):
-        self.page_width, self.page_height = A4
-        self.margin = 36
-        self.gap = 12
+    def __init__(self, ppt_files: List[str], output_path: str):
+        # 将旧格式转换为新格式
+        file_list = []
+        for i, ppt_file in enumerate(ppt_files):
+            file_list.append({
+                'file': ppt_file,
+                'title': Path(ppt_file).stem,
+                'type': 'ppt',
+                'order': i
+            })
 
-        # 布局参数
-        self.slides_per_row = 2
-        self.slides_per_col = 4
-        self.slides_per_page = 8
-
-        # 计算每个幻灯片槽位的尺寸
-        available_width = self.page_width - 2 * self.margin - (self.slides_per_row - 1) * self.gap
-        available_height = self.page_height - 2 * self.margin - (self.slides_per_col - 1) * self.gap - 40  # 为页码留更多空间
-
-        self.slot_width = available_width / self.slides_per_row
-        self.slot_height = available_height / self.slides_per_col
-
-        # 注册中文字体
-        self.font_name = self._register_chinese_font()
-
-        logging.info(f"幻灯片槽位尺寸: {self.slot_width:.1f} x {self.slot_height:.1f} points")
-
-    def _register_chinese_font(self) -> str:
-        """注册中文字体"""
-        try:
-            font_paths = [
-                r"C:\Windows\Fonts\simhei.ttf",
-                r"C:\Windows\Fonts\simsun.ttc",
-                r"C:\Windows\Fonts\msyh.ttc",
-            ]
-
-            for font_path in font_paths:
-                if os.path.exists(font_path):
-                    try:
-                        if "simhei" in font_path.lower():
-                            pdfmetrics.registerFont(TTFont("SimHei", font_path))
-                            return "SimHei"
-                        elif "simsun" in font_path.lower():
-                            pdfmetrics.registerFont(TTFont("SimSun", font_path))
-                            return "SimSun"
-                        elif "msyh" in font_path.lower():
-                            pdfmetrics.registerFont(TTFont("MSYaHei", font_path))
-                            return "MSYaHei"
-                    except Exception as e:
-                        logging.debug(f"注册字体失败 {font_path}: {e}")
-                        continue
-
-            logging.warning("未找到中文字体，使用默认字体")
-            return "Helvetica"
-
-        except Exception as e:
-            logging.error(f"字体注册失败: {e}")
-            return "Helvetica"
-
-    def create_layout_pdf(self, slide_images: List[str], output_path: str, title: str = "") -> bool:
-        """创建布局PDF - 不添加页码（由合并器统一处理）"""
-        try:
-            logging.info(f"创建布局PDF: {len(slide_images)} 张幻灯片")
-
-            c = canvas.Canvas(output_path, pagesize=A4)
-
-            # 设置文档信息
-            c.setTitle(title if title else "PPT幻灯片")
-            c.setAuthor("PPT2Manual")
-            c.setSubject("PPT转换PDF")
-
-            page_num = 1
-
-            # 按每页8张幻灯片分组处理
-            for page_start in range(0, len(slide_images), self.slides_per_page):
-                if page_start > 0:
-                    c.showPage()
-
-                # 当前页面的幻灯片
-                page_slides = slide_images[page_start:page_start + self.slides_per_page]
-
-                logging.info(f"处理第 {page_num} 页，包含 {len(page_slides)} 张幻灯片")
-
-                # 绘制幻灯片
-                for position, slide_path in enumerate(page_slides):
-                    if os.path.exists(slide_path):
-                        self._draw_slide_with_correct_aspect_ratio(c, slide_path, position)
-                    else:
-                        logging.warning(f"幻灯片图片不存在: {slide_path}")
-                        self._draw_error_placeholder(c, position, f"缺失: {os.path.basename(slide_path)}")
-
-                # 不在这里添加页码，由PDF合并器统一处理
-                page_num += 1
-
-            c.save()
-            logging.info(f"布局PDF创建完成: {output_path}")
-            return True
-
-        except Exception as e:
-            logging.error(f"创建布局PDF失败: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            return False
-
-    def _calculate_slot_position(self, position: int) -> Tuple[float, float]:
-        """计算槽位的左下角坐标"""
-        row = position // self.slides_per_row
-        col = position % self.slides_per_row
-
-        x = self.margin + col * (self.slot_width + self.gap)
-        y = self.page_height - self.margin - (row + 1) * (self.slot_height + self.gap)
-
-        return x, y
-
-    def _draw_slide_with_correct_aspect_ratio(self, canvas_obj, slide_path: str, position: int):
-        """绘制保持正确宽高比的单张幻灯片"""
-        try:
-            # 计算槽位位置
-            slot_x, slot_y = self._calculate_slot_position(position)
-
-            # 获取图片的真实尺寸
-            with Image.open(slide_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-
-                original_width, original_height = img.size
-                original_aspect_ratio = original_width / original_height
-
-                logging.debug(
-                    f"幻灯片 {position + 1}: 原始尺寸 {original_width}x{original_height}, 宽高比 {original_aspect_ratio:.3f}")
-
-                # 计算槽位的宽高比
-                slot_aspect_ratio = self.slot_width / self.slot_height
-
-                # 计算实际显示尺寸，保持宽高比
-                if original_aspect_ratio > slot_aspect_ratio:
-                    # 图片更宽，以宽度为准
-                    display_width = self.slot_width
-                    display_height = self.slot_width / original_aspect_ratio
-                else:
-                    # 图片更高，以高度为准
-                    display_height = self.slot_height
-                    display_width = self.slot_height * original_aspect_ratio
-
-                # 计算居中位置
-                img_x = slot_x + (self.slot_width - display_width) / 2
-                img_y = slot_y + (self.slot_height - display_height) / 2
-
-                logging.debug(
-                    f"幻灯片 {position + 1}: 显示尺寸 {display_width:.1f}x{display_height:.1f}, 位置 ({img_x:.1f}, {img_y:.1f})")
-
-                # 处理图片尺寸以提高性能
-                max_display_dimension = max(display_width, display_height) * 2  # 2倍分辨率确保清晰度
-                if max(original_width, original_height) > max_display_dimension * 2:
-                    # 只有当原图远大于显示尺寸时才缩放
-                    scale_factor = (max_display_dimension * 2) / max(original_width, original_height)
-                    new_width = int(original_width * scale_factor)
-                    new_height = int(original_height * scale_factor)
-                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    logging.debug(f"图片预缩放: {original_width}x{original_height} -> {new_width}x{new_height}")
-
-                # 创建ImageReader
-                img_buffer = io.BytesIO()
-                img.save(img_buffer, format='PNG', quality=95)
-                img_buffer.seek(0)
-                image_reader = ImageReader(img_buffer)
-
-                # 绘制槽位边框（调试用，可选）
-                canvas_obj.setStrokeColor((0.95, 0.95, 0.95))
-                canvas_obj.setLineWidth(0.25)
-                canvas_obj.rect(slot_x, slot_y, self.slot_width, self.slot_height)
-
-                # 绘制图片
-                canvas_obj.drawImage(
-                    image_reader,
-                    img_x, img_y,
-                    width=display_width,
-                    height=display_height
-                )
-
-                # 绘制图片边框
-                canvas_obj.setStrokeColor(lightgrey)
-                canvas_obj.setLineWidth(0.5)
-                canvas_obj.rect(img_x, img_y, display_width, display_height)
-
-        except Exception as e:
-            logging.error(f"绘制幻灯片失败 {slide_path}: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            self._draw_error_placeholder(canvas_obj, position, f"错误: {os.path.basename(slide_path)}")
-
-    def _draw_error_placeholder(self, canvas_obj, position: int, error_text: str):
-        """绘制错误占位符"""
-        try:
-            slot_x, slot_y = self._calculate_slot_position(position)
-
-            # 绘制灰色背景
-            canvas_obj.setFillColor(lightgrey)
-            canvas_obj.rect(slot_x, slot_y, self.slot_width, self.slot_height, fill=1)
-
-            # 绘制错误文本
-            canvas_obj.setFillColor(black)
-            canvas_obj.setFont(self.font_name, 8)
-
-            # 计算文本位置（居中）
-            text_width = canvas_obj.stringWidth(error_text, self.font_name, 8)
-            text_x = slot_x + (self.slot_width - text_width) / 2
-            text_y = slot_y + self.slot_height / 2
-
-            canvas_obj.drawString(text_x, text_y, error_text)
-
-            # 绘制边框
-            canvas_obj.setStrokeColor(black)
-            canvas_obj.setLineWidth(0.5)
-            canvas_obj.rect(slot_x, slot_y, self.slot_width, self.slot_height)
-
-        except Exception as e:
-            logging.error(f"绘制错误占位符失败: {e}")
+        super().__init__(file_list, output_path)
